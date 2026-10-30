@@ -14,7 +14,7 @@ from app.services import captivity, death, homes
 from app.services import hirelings as hr
 from app.services import inventory as inv
 from app.services import rules
-from app.services.chars import get_char, jload, now, player_stats
+from app.services.chars import get_char, is_protected, jload, now, player_stats
 from app.services.errors import GameError
 from app.services.notify import notify
 from app.services.sched import schedule
@@ -22,7 +22,7 @@ from app.services.sched import schedule
 ATTACK_FA = {"direct": "حمله مستقیم", "ambush": "حمله غافلگیرانه", "pursue": "تعقیب", "siege": "محاصره"}
 OUTCOME_FA = {
     "att_defeated": "مهاجم شکست خورد", "def_defeated": "مدافع شکست خورد", "fled_att": "مهاجم عقب‌نشینی کرد",
-    "fled_def": "مدافع فرار کرد", "cancelled": "حمله لغو شد", "timeout": "مهلت تمام شد؛ حمله لغو شد",
+    "fled_def": "مدافع فرار کرد", "cancelled": "حمله لغو شد", "raid_open": "ورود بدون درگیری", "timeout": "مهلت تمام شد؛ حمله لغو شد",
 }
 
 
@@ -36,6 +36,18 @@ def _alive(parts):
     return [p for p in parts if p["hp"] > 0 and p["k"] != "struct"]
 
 
+async def in_combat(conn, ids: list) -> bool:
+    """آیا یکی از این کاربران در نبرد باز (مهاجم، مدافع یا هم‌دست) است؟"""
+    return bool(await conn.fetchval(
+        "SELECT 1 FROM combats WHERE state <> 'closed' AND (attacker_user_id = ANY($1::bigint[]) OR "
+        "defender_user_id = ANY($1::bigint[]) OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(party) p "
+        "WHERE p::bigint = ANY($1::bigint[]))) LIMIT 1", ids))
+
+
+def is_att(c: dict, uid: int) -> bool:
+    return uid in c["party"]
+
+
 # ───────── ذخیره و بارگذاری ─────────
 async def get(conn, cid: int, lock: bool = True):
     r = await conn.fetchrow("SELECT * FROM combats WHERE id=$1" + (" FOR UPDATE" if lock else ""), cid)
@@ -43,6 +55,7 @@ async def get(conn, cid: int, lock: bool = True):
         raise GameError("این نبرد پیدا نشد.")
     c = dict(r)
     c["sides"], c["mods"], c["log"] = jload(r["sides"]), jload(r["mods"]), jload(r["log"])
+    c["party"] = [int(x) for x in jload(r["party"])] or [r["attacker_user_id"]]
     return c
 
 
@@ -56,6 +69,10 @@ async def _save(conn, c, **fields):
         sets.append(f"{k}=${len(args)}")
         c[k] = v
     await conn.execute(f"UPDATE combats SET {', '.join(sets)} WHERE id=$1", *args)
+    if fields.get("state") == "closed" and c["mods"].get("away"):
+        c["mods"]["away"] = False
+        await conn.execute("UPDATE characters SET location='home' WHERE location='operation' AND user_id = ANY($1::bigint[])",
+                           c["party"])
 
 
 async def _arm_timer(conn, settings, c, seconds: int = None):
@@ -109,21 +126,20 @@ async def start_attack(conn, settings, attacker_id: int, target_id: int, chat_id
         raise GameError("این بازیکن در دسترس نیست.")
     if t_ch["location"] in ("dead", "captive"):
         raise GameError("هدف در حال حاضر قابل حمله نیست (مرده یا اسیر).")
-    if tu["protected_until"] and tu["protected_until"] > now():
-        raise GameError("🛡 این بازیکن تازه‌وارد است و هنوز محافظت اولیه دارد.")
+    if is_protected(tu):
+        raise GameError("🛡 این بازیکن تازه‌وارد است و هنوز محافظ دارد.")
     if tu["captive_immune_until"] and tu["captive_immune_until"] > now():
         raise GameError("این بازیکن تازه از اسارت آزاد شده و موقتاً مصون است.")
     cd = int(settings.get("combat.repeat_cooldown_min"))
     if await conn.fetchval("SELECT 1 FROM combats WHERE attacker_user_id=$1 AND defender_user_id=$2 "
                            "AND created_at > now() - make_interval(mins => $3)", attacker_id, target_id, cd):
         raise GameError(f"به همین هدف تا {cd} دقیقه بعد از حمله قبلی نمی‌توانی دوباره حمله کنی.")
-    if await conn.fetchval("SELECT 1 FROM combats WHERE state <> 'closed' AND (attacker_user_id=ANY($1::bigint[]) "
-                           "OR defender_user_id=ANY($1::bigint[]))", [attacker_id, target_id]):
+    if await in_combat(conn, [attacker_id, target_id]):
         raise GameError("یکی از دو طرف در نبرد دیگری است.")
     notice = ""
-    if au["protected_until"] and au["protected_until"] > now():
+    if is_protected(au):
         await conn.execute("UPDATE users SET protected_until=NULL WHERE id=$1", attacker_id)
-        notice = "⚠️ با حمله کردن، محافظت اولیه‌ات پایان یافت.\n"
+        notice = "⚠️ با حمله کردن، محافظ تازه‌وارد پایان یافت.\n"
 
     me, st, _ = await _player_part(conn, settings, attacker_id)
     comp_parts, comp_raw = await _companions(conn, settings, attacker_id)
@@ -133,6 +149,8 @@ async def start_attack(conn, settings, attacker_id: int, target_id: int, chat_id
     mods = {"att_type": None, "ambush": None, "recon_extra": False, "alerted": False, "def_joined": False,
             "trap": 0.0, "trap_seen": False, "def_base": 1.0, "looter": None, "drop_id": None, "raid_steps": 0,
             "result": "", "notice": notice, "att_stealth": st["stealth"], "recon": []}
+    if home_flow:
+        raise GameError("او در خانه است؛ برای حمله به خانه بنویس «حمله به خانه» (تکی یا با دوستان).")
     if home_flow:
         dp = await homes.defense_participants(conn, settings, target_id)
         dfn = dp["parts"] + [{"k": "struct", "id": 0, "name": "دفاع خانه", "hp": 1, "max": 1, "power": 0, "def": 0}]
@@ -153,10 +171,11 @@ async def start_attack(conn, settings, attacker_id: int, target_id: int, chat_id
         mods["def_perception"] = t_stats["perception"] + an.perk_total(traw, "alert")
         state, flow = "choose", "open"
     cid = await conn.fetchval(
-        "INSERT INTO combats(chat_id, message_id, flow, attacker_user_id, defender_user_id, state, sides, mods) "
-        "VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb) RETURNING id",
+        "INSERT INTO combats(chat_id, message_id, flow, attacker_user_id, defender_user_id, state, sides, mods, party) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb) RETURNING id",
         chat_id, message_id, flow, attacker_id, target_id, state,
-        json.dumps({"att": att, "def": dfn}, ensure_ascii=False), json.dumps(mods, ensure_ascii=False))
+        json.dumps({"att": att, "def": dfn}, ensure_ascii=False), json.dumps(mods, ensure_ascii=False),
+        json.dumps([attacker_id]))
     c = await get(conn, cid)
     await _save(conn, c)
     await _arm_timer(conn, settings, c, int(settings.get("combat.round_timeout_sec")) * 2)
@@ -192,10 +211,11 @@ async def start_tribe_attack(conn, settings, attacker_id: int, tribe_id: int, ch
     mods["recon_perc"] = perc
     mods["recon"] = rules.recon_report(info, perc, st["power"], rng)
     cid = await conn.fetchval(
-        "INSERT INTO combats(chat_id, message_id, flow, attacker_user_id, defender_tribe_id, state, sides, mods) "
-        "VALUES($1,$2,'tribe',$3,$4,'recon',$5::jsonb,$6::jsonb) RETURNING id",
+        "INSERT INTO combats(chat_id, message_id, flow, attacker_user_id, defender_tribe_id, state, sides, mods, party) "
+        "VALUES($1,$2,'tribe',$3,$4,'recon',$5::jsonb,$6::jsonb,$7::jsonb) RETURNING id",
         chat_id, message_id, attacker_id, tribe_id,
-        json.dumps({"att": [me] + comp_parts, "def": dfn}, ensure_ascii=False), json.dumps(mods, ensure_ascii=False))
+        json.dumps({"att": [me] + comp_parts, "def": dfn}, ensure_ascii=False), json.dumps(mods, ensure_ascii=False),
+        json.dumps([attacker_id]))
     c = await get(conn, cid)
     await _save(conn, c)
     await _arm_timer(conn, settings, c, int(settings.get("combat.round_timeout_sec")) * 2)
@@ -226,9 +246,11 @@ async def _inform_defenders(conn, c, text: str):
 
 # ───────── اکشن‌ها ─────────
 async def cancel(conn, settings, c, user_id: int):
-    if user_id != c["attacker_user_id"] or c["state"] not in ("recon", "choose"):
+    if user_id != c["attacker_user_id"] or c["state"] not in ("recon", "choose", "party", "approach"):
         raise GameError("اجازه نداری.")
     c["mods"]["result"] = "حمله لغو شد."
+    if c["state"] == "approach":
+        await persist_all(conn, settings, c)
     await _save(conn, c, state="closed", outcome="cancelled", ended_at=now())
 
 
@@ -300,7 +322,7 @@ async def join(conn, settings, c, user_id: int, rng):
 
 
 async def continue_round(conn, settings, c, user_id: int, rng, auto: bool = False):
-    if c["state"] != "round" or (user_id != c["attacker_user_id"] and not auto):
+    if c["state"] != "round" or (not is_att(c, user_id) and not auto):
         raise GameError("اجازه نداری.")
     await _round(conn, settings, c, rng)
 
@@ -342,7 +364,7 @@ async def flee(conn, settings, c, user_id: int, rng):
     if c["state"] != "round":
         raise GameError("الان نمی‌توانی فرار کنی.")
     s, m = c["sides"], c["mods"]
-    if user_id == c["attacker_user_id"]:
+    if is_att(c, user_id):
         mine, other, side = s["att"], s["def"], "att"
     elif user_id == c["defender_user_id"]:
         mine, other, side = s["def"], s["att"], "def"
@@ -362,6 +384,12 @@ async def flee(conn, settings, c, user_id: int, rng):
                                  op / (mp + op + 1e-9))
     if rng.random() < chance:
         c["log"].append(f"🏃 {me['name']} با موفقیت فرار کرد")
+        if side == "att" and len([p for p in s["att"] if p["k"] == "player" and p["id"] != user_id and p["hp"] > 0]) > 0:
+            # در حمله گروهی فقط همین نفر (و همراهانش) کنار می‌کشد
+            await _persist_part(conn, me)
+            s["att"] = [p for p in s["att"] if p.get("owner", p["id"] if p["k"] == "player" else None) != user_id]
+            await _save(conn, c)
+            return
         return await _finish(conn, settings, c, "fled_att" if side == "att" else "fled_def", rng)
     c["log"].append(f"❌ تلاش {me['name']} برای فرار ناکام ماند و طرف مقابل ضربه زد")
     if side == "att":
@@ -394,51 +422,69 @@ async def _fate(conn, settings, c, victim: int, victor: int, victor_parts: list,
     return "death"
 
 
+async def _persist_part(conn, p: dict, drop_id: int = None) -> None:
+    if p["k"] == "animal":
+        await an.apply_result(conn, p)
+    elif p["k"] == "hireling":
+        await hr.apply_result(conn, p, drop_id)
+    elif p["k"] == "player" and p["hp"] > 0:
+        await conn.execute("UPDATE characters SET health=$2 WHERE user_id=$1", p["id"], p["hp"])
+
+
+async def persist_all(conn, settings, c) -> None:
+    """سلامتی/مرگ همه شرکت‌کنندگان را فقط یک‌بار ذخیره می‌کند."""
+    if c["mods"].get("persisted"):
+        return
+    drop = None
+    for p in c["sides"]["att"] + c["sides"]["def"]:
+        if p["k"] == "hireling" and p["hp"] <= 0 and drop is None:
+            drop = await _ensure_drop(conn, settings, c)
+        await _persist_part(conn, p, drop)
+    c["mods"]["persisted"] = True
+
+
+async def _inform_party(conn, c, text: str):
+    for uid in c["party"]:
+        await notify(conn, uid, "combat", text)
+
+
 async def _finish(conn, settings, c, outcome: str, rng):
     s, m = c["sides"], c["mods"]
-    result_lines = [OUTCOME_FA.get(outcome, outcome)]
-    victim_state = None
-    # ۱) ذخیره سلامتی شرکت‌کنندگان
-    drop_for_hireling = None
-    for p in s["att"] + s["def"]:
-        if p["k"] == "animal":
-            await an.apply_result(conn, p)
-        elif p["k"] == "hireling":
-            if p["hp"] <= 0 and not drop_for_hireling:
-                drop_for_hireling = await _ensure_drop(conn, settings, c)
-            await hr.apply_result(conn, p, drop_for_hireling)
-        elif p["k"] == "player" and p["hp"] > 0:
-            await conn.execute("UPDATE characters SET health=$2 WHERE user_id=$1", p["id"], p["hp"])
+    lines = [OUTCOME_FA.get(outcome, outcome)]
+    await persist_all(conn, settings, c)
     att_id, def_id = c["attacker_user_id"], c["defender_user_id"]
-    me_att = s["att"][0]["name"]
-    me_def = next((p["name"] for p in s["def"] if p["k"] == "player"), None)
     looter = None
-    # ۲) نتیجه
     if outcome == "att_defeated":
-        victor = def_id
-        victim_state = await _fate(conn, settings, c, att_id, victor, s["def"], rng)
-        result_lines.append(f"{me_att} {'اسیر شد ⛓' if victim_state == 'captured' else 'کشته شد ☠️'}")
-        if victim_state == "death" and victor:
-            looter = "def"
+        for p in [x for x in s["att"] if x["k"] == "player" and x["hp"] <= 0]:
+            st = await _fate(conn, settings, c, p["id"], def_id, s["def"], rng)
+            lines.append(f"{p['name']} {'اسیر شد ⛓' if st == 'captured' else 'کشته شد ☠️'}")
+            if st == "death" and def_id:
+                looter = "def"
     elif outcome == "def_defeated":
-        victor = att_id
         pl = next((p for p in s["def"] if p["k"] == "player"), None)
         if pl is not None and pl["hp"] <= 0:
-            victim_state = await _fate(conn, settings, c, pl["id"], victor, s["att"], rng)
-            result_lines.append(f"{pl['name']} {'اسیر شد ⛓' if victim_state == 'captured' else 'کشته شد ☠️'}")
+            if c["kind"] == "hostage":
+                others = [u for u in c["party"] if u != att_id]
+                await captivity.capture(conn, settings, pl["id"], att_id, others)
+                await captivity.split_items(conn, settings, pl["id"], c["party"])
+                lines.append(f"{pl['name']} گروگان گرفته شد ⛓ و غنیمتش بین {len(c['party'])} نفر تقسیم شد")
+            else:
+                st = await _fate(conn, settings, c, pl["id"], att_id, s["att"], rng)
+                lines.append(f"{pl['name']} {'اسیر شد ⛓' if st == 'captured' else 'کشته شد ☠️'}")
         else:
-            result_lines.append("دفاع شکسته شد 🏚")
+            lines.append("دفاع شکسته شد 🏚")
         looter = "att"
         from app.services import events as ev
-        await ev.season_score(conn, victor, 10)
+        for uid in c["party"]:
+            await ev.season_score(conn, uid, 10)
     elif outcome in ("fled_att", "fled_def"):
-        who = att_id if outcome == "fled_att" else def_id
-        if who:
-            await conn.execute("UPDATE characters SET fatigue=LEAST(100,fatigue+$2) WHERE user_id=$1", who,
-                               int(settings.get("combat.flee_fatigue")))
-    m["result"] = "\n".join(result_lines)
-    c["log"].append("🏁 " + " | ".join(result_lines))
-    # ۳) غارت یا بستن
+        who = c["party"] if outcome == "fled_att" else [def_id]
+        for u in who:
+            if u:
+                await conn.execute("UPDATE characters SET fatigue=LEAST(100,fatigue+$2) WHERE user_id=$1", u,
+                                   int(settings.get("combat.flee_fatigue")))
+    m["result"] = "\n".join(lines)
+    c["log"].append("🏁 " + " | ".join(lines))
     drop_has = False
     if m["drop_id"]:
         drop_has = bool(await conn.fetchval(
@@ -452,17 +498,17 @@ async def _finish(conn, settings, c, outcome: str, rng):
     else:
         await _save(conn, c, state="closed", outcome=outcome, ended_at=now(),
                     victor="att" if outcome == "def_defeated" else "def" if outcome == "att_defeated" else "none")
-    await _inform_defenders(conn, c, "📜 نتیجه نبرد: " + "؛ ".join(result_lines))
-    await notify(conn, att_id, "combat", "📜 نتیجه نبرد: " + "؛ ".join(result_lines))
+    await _inform_defenders(conn, c, "📜 نتیجه نبرد: " + "؛ ".join(lines))
+    await _inform_party(conn, c, "📜 نتیجه نبرد: " + "؛ ".join(lines))
 
 
 # ───────── غنیمت ─────────
-def _looter_id(c):
-    return c["attacker_user_id"] if c["mods"]["looter"] == "att" else c["defender_user_id"]
+def can_loot(c, uid: int) -> bool:
+    return is_att(c, uid) if c["mods"]["looter"] == "att" else uid == c["defender_user_id"]
 
 
 async def loot_take(conn, settings, c, user_id: int):
-    if c["state"] != "loot" or user_id != _looter_id(c) or not c["mods"]["drop_id"]:
+    if c["state"] != "loot" or not can_loot(c, user_id) or not c["mods"]["drop_id"]:
         raise GameError("غنیمتی برای برداشتن نیست.")
     taken = await inv.pickup_from_ground(conn, settings, user_id, await get_char(conn, user_id), c["mods"]["drop_id"])
     c["log"].append("🎒 برداشتی: " + ("، ".join(f"{n} ×{q}" for n, q in taken) if taken else "چیزی جا نشد"))
@@ -472,14 +518,14 @@ async def loot_take(conn, settings, c, user_id: int):
 
 async def loot_raid(conn, settings, c, user_id: int, rng):
     m = c["mods"]
-    if c["state"] != "loot" or m["looter"] != "att" or user_id != c["attacker_user_id"] or c["flow"] not in ("home", "tribe"):
+    if c["state"] != "loot" or m["looter"] != "att" or not is_att(c, user_id) or c["flow"] not in ("home", "tribe"):
         raise GameError("غارت ممکن نیست.")
     steps = int(settings.get("loot.steps"))
     if m["raid_steps"] >= steps:
         raise GameError("مراحل غارت تمام شده است.")
     alive = len(_alive(c["sides"]["def"]))
     chance = max(0.1, float(settings.get("loot.base_success")) - float(settings.get("loot.step_penalty")) * m["raid_steps"]
-                 - 0.04 * alive)
+                 - 0.04 * alive - (float(settings.get("raid.defend_alert_penalty")) if m.get("def_alert") else 0.0))
     m["raid_steps"] += 1
     if rng.random() > chance:
         c["log"].append("🚨 آژیر به صدا درآمد؛ مجبور شدی عقب‌نشینی کنی")
@@ -542,7 +588,7 @@ async def loot_raid(conn, settings, c, user_id: int, rng):
 
 
 async def loot_finish(conn, settings, c, user_id: int):
-    if c["state"] != "loot" or user_id != _looter_id(c):
+    if c["state"] != "loot" or not can_loot(c, user_id):
         raise GameError("اجازه نداری.")
     await _save(conn, c, state="closed", ended_at=now())
 
@@ -555,6 +601,9 @@ async def on_timeout(conn, settings, cid: int, version: int, rng: random.Random 
     if r is None or r["version"] != version:
         return False
     c = await get(conn, cid)
+    if c["state"] in ("party", "approach", "defend_prompt", "guard_choice"):
+        from app.services import party
+        return await party.on_timeout(conn, settings, c, rng)
     if c["state"] in ("recon", "choose"):
         c["mods"]["result"] = "مهلت تمام شد؛ حمله لغو شد."
         await _save(conn, c, state="closed", outcome="timeout", ended_at=now())
@@ -576,7 +625,12 @@ def _hp_line(p) -> str:
 def describe(c) -> tuple:
     """(متن, دکمه‌ها[(برچسب, اکشن)]) — برای پیام گروه."""
     s, m = c["sides"], c["mods"]
+    if c["state"] in ("party", "approach", "defend_prompt", "guard_choice"):
+        from app.services import party
+        return party.describe(c)
     head = {"open": "⚔️ <b>درگیری</b>", "home": "🏚 <b>حمله به خانه</b>", "tribe": "🏰 <b>حمله به پایگاه قبیله</b>"}[c["flow"]]
+    if c.get("kind") == "hostage":
+        head = "🥷 <b>گروگانگیری</b>"
     lines = [head]
     if m.get("notice"):
         lines.append(m["notice"].strip())
@@ -597,12 +651,12 @@ def describe(c) -> tuple:
         lines += ["", "<b>گزارش</b>"] + c["log"][-8:]
     if c["state"] == "round":
         btns = [("➡️ ادامه حمله", "continue"), ("🏃 فرار", "flee")]
-        if c["flow"] == "home" and not m["def_joined"] and c["round_no"] <= 2:
+        if c["flow"] == "home" and c.get("kind", "attack") == "attack" and not m["def_joined"] and c["round_no"] <= 2:
             btns.append(("🛡 ورود مدافع", "join"))
         return "\n".join(lines), btns
     if c["state"] == "loot":
-        btns = [("🎒 برداشت غنیمت", "take")]
-        if m["looter"] == "att" and c["flow"] in ("home", "tribe") and m["raid_steps"] < 99:
+        btns = [("🎒 برداشت غنیمت", "take")] if m.get("drop_id") else []
+        if m["looter"] == "att" and c["flow"] in ("home", "tribe"):
             btns.append(("🏚 غارت مرحله‌ای", "raid"))
         btns.append(("✅ پایان", "finish"))
         return "\n".join(lines), btns
@@ -636,6 +690,14 @@ async def perform(conn, settings, cid: int, version: int, user_id: int, act: str
         await loot_raid(conn, settings, c, user_id, rng)
     elif act == "finish":
         await loot_finish(conn, settings, c, user_id)
+    elif act in ("pj", "pn", "defend", "surrender", "gfight", "gbypass"):
+        from app.services import party
+        if act in ("pj", "pn"):
+            await party.respond(conn, settings, c, user_id, act == "pj", rng)
+        elif act in ("defend", "surrender"):
+            await party.defender_choice(conn, settings, c, user_id, act, rng)
+        else:
+            await party.guard_decision(conn, settings, c, user_id, "fight" if act == "gfight" else "bypass", rng)
     else:
         raise GameError("اکشن نامعتبر.")
     return await get(conn, cid, lock=False)

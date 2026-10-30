@@ -176,8 +176,14 @@ def resolve_round(att: list, dfn: list, att_mult: float, def_mult: float, p: dic
 
 
 def attacker_down(att: list) -> bool:
+    """مهاجمان وقتی شکست می‌خورند که همه بازیکن‌هایشان از پا افتاده باشند (حمله گروهی)."""
     pl = [x for x in att if x["k"] == "player"]
-    return bool(pl) and pl[0]["hp"] <= 0
+    return bool(pl) and all(x["hp"] <= 0 for x in pl)
+
+
+def trap_detect_chance(perception: int, char_level: int, trap: float) -> float:
+    """شناسایی تله: تله ضعیف‌تر و سطح/ادراک بالاتر = شناسایی راحت‌تر."""
+    return clamp(0.30 + 0.05 * perception + 0.02 * char_level - 0.012 * trap, 0.1, 0.9)
 
 
 def defender_down(dfn: list, flow: str) -> bool:

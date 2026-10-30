@@ -13,11 +13,12 @@ _MIGRATION_LOCK = 727001
 
 async def create_pool(dsn: str) -> asyncpg.Pool:
     # اتصال‌های بیکار زود بسته می‌شوند تا دیتابیس خارجی بتواند بخوابد
+    pooled = "-pooler" in dsn            # PgBouncer کش دستورها را نمی‌پذیرد؛ اتصال مستقیم سریع‌تر است
     return await asyncpg.create_pool(
         dsn,
-        min_size=1,
-        max_size=5,
-        statement_cache_size=0,
+        min_size=2,
+        max_size=6,
+        statement_cache_size=0 if pooled else 100,
         max_inactive_connection_lifetime=30,
         command_timeout=30,
     )

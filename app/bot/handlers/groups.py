@@ -10,6 +10,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.bot import texts_fa as t
+from app.bot.ui import btn
 from app.context import AppContext
 from app.runtime import with_user
 from app.services import events
@@ -38,8 +39,7 @@ async def render_event(ctx: AppContext, eid: int) -> tuple:
         e = await events.event_row(conn, eid)
         claims = await _claims(conn, eid)
     text, btns = events.event_text(e, claims)
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=Ev(e=eid).pack())
-                                                    for label, _ in btns]]) if btns else None
+    markup = InlineKeyboardMarkup(inline_keyboard=[[btn(label, Ev(e=eid).pack(), "success") for label, _ in btns]]) if btns else None
     return e, text, markup
 
 

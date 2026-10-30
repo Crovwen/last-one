@@ -23,19 +23,26 @@ def skills_of(ch) -> dict:
     return {k: int(sk.get(k, 1)) for k in SKILLS}
 
 
+def is_protected(user) -> bool:
+    """محافظ تازه‌وارد: فعال یعنی زمانش نگذشته و بازیکن آن را خاموش نکرده."""
+    return bool(user["protected_until"] and user["protected_until"] > now() and not user["protection_off"])
+
+
 async def refresh_vitals(conn, settings, user_id: int, at=None):
-    """محاسبه تنبل نیازها (تا لحظه at یا اکنون) و ذخیره. ردیف تازه شخصیت را برمی‌گرداند."""
+    """محاسبه تنبل نیازها (تا لحظه at یا اکنون). اگر کمتر از ۳۰ ثانیه گذشته باشد چیزی نمی‌نویسد."""
     ch = await conn.fetchrow("SELECT * FROM characters WHERE user_id=$1 FOR UPDATE", user_id)
     if ch is None:
         return None
     t = at or now()
     if at is not None and at < ch["vitals_updated_at"]:
         t = ch["vitals_updated_at"]
+    elapsed = (t - ch["vitals_updated_at"]).total_seconds()
+    if at is None and elapsed < 30:
+        return ch
     new = rules.compute_vitals(dict(ch), t, settings.get, rules.environment(t, settings.get))
-    await conn.execute(
+    return await conn.fetchrow(
         "UPDATE characters SET health=$2, hunger=$3, thirst=$4, energy=$5, fatigue=$6, vitals_updated_at=$7 "
-        "WHERE user_id=$1", user_id, new["health"], new["hunger"], new["thirst"], new["energy"], new["fatigue"], t)
-    return await conn.fetchrow("SELECT * FROM characters WHERE user_id=$1", user_id)
+        "WHERE user_id=$1 RETURNING *", user_id, new["health"], new["hunger"], new["thirst"], new["energy"], new["fatigue"], t)
 
 
 def require_free(ch, what: str = "این کار"):

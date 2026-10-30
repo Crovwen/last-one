@@ -164,7 +164,7 @@ def test_combat_describe_states():
     side = {"att": [{"k": "player", "id": 1, "name": "A", "hp": 50, "max": 100, "power": 10, "def": 0, "end": 3}],
             "def": [{"k": "hireling", "id": 2, "name": "G", "hp": 30, "max": 50, "power": 5, "def": 0},
                     {"k": "struct", "id": 0, "name": "S", "hp": 1, "max": 1, "power": 0, "def": 0}]}
-    mods = {"recon": ["نگهبان انسانی: ۱"], "result": "", "notice": "", "def_joined": False, "looter": "att", "raid_steps": 0}
+    mods = {"recon": ["نگهبان انسانی: ۱"], "result": "", "notice": "", "def_joined": False, "looter": "att", "raid_steps": 0, "drop_id": 5}
     base = dict(flow="home", side=None, sides=side, mods=mods, log=["x"], round_no=1, outcome=None)
     expect = {"recon": {"start", "recon", "cancel"}, "choose": {"direct", "ambush", "pursue", "siege", "cancel"},
               "round": {"continue", "flee", "join"}, "loot": {"take", "raid", "finish"}, "closed": set()}
@@ -206,3 +206,72 @@ def test_cold_makes_hunger_faster():
     cold = rules.compute_vitals(ch, now, s.get, {"night": False, "weather": "cold"})
     clear = rules.compute_vitals(ch, now, s.get, {"night": False, "weather": "clear"})
     assert cold["hunger"] < clear["hunger"]
+
+
+def test_mug_amount_small_and_scaled():
+    from app.services.mug import mug_amount, mug_chance
+    assert mug_amount(100, 0, 0.05, 20, 250) == 20            # حداقل
+    assert mug_amount(2000, 0, 0.05, 20, 250) == 100          # متناسب با ثروت
+    assert mug_amount(100000, 0, 0.05, 20, 250) == 250        # سقف
+    assert mug_amount(100, 100, 0.05, 20, 250) == 0           # سکه‌های قفل دزدیده نمی‌شود
+    assert mug_amount(10, 0, 0.05, 20, 250) <= 5              # هرگز همه پول نیست
+    assert 0.1 <= mug_chance(1, 100) < mug_chance(100, 1) <= 0.9
+
+
+def test_trap_detection_depends_on_trap_and_level():
+    weak = rules.trap_detect_chance(5, 5, 8)
+    strong = rules.trap_detect_chance(5, 5, 50)
+    assert weak > strong
+    assert rules.trap_detect_chance(5, 30, 20) > rules.trap_detect_chance(5, 1, 20)
+    assert 0.1 <= strong <= weak <= 0.9
+
+
+def test_attacker_down_needs_all_players():
+    a = [{"k": "player", "id": 1, "hp": 0, "max": 100, "power": 1}, {"k": "player", "id": 2, "hp": 10, "max": 100, "power": 1}]
+    assert not rules.attacker_down(a)
+    a[1]["hp"] = 0
+    assert rules.attacker_down(a)
+
+
+def test_parse_mentions_and_group_commands():
+    from app.bot.commands import KEYWORDS, norm
+    from app.bot.handlers.group_text import parse_combat_command
+    from app.services.party import parse_mentions
+    assert parse_mentions("گروگانگیری با @Ali1234 @mamad_324 @ali1234") == ["ali1234", "mamad_324"]
+    t = norm
+    assert parse_combat_command(t("حمله")) == ("attack", [])
+    assert parse_combat_command(t("حمله به خانه")) == ("raid", [])
+    assert parse_combat_command(t("حمله به خانه با @a_bc @d_ef")) == ("raid", ["a_bc", "d_ef"])
+    assert parse_combat_command(t("گروگانگیری با @a_bc")) == ("hostage", ["a_bc"])
+    assert parse_combat_command(t("خفتگیری")) == ("mug", [])
+    assert parse_combat_command(t("حمله به شهر")) is None
+    assert KEYWORDS[t("جنگل")][0] == "fo" and KEYWORDS[t("خرید حیوان")][0] == "anb"
+    assert KEYWORDS[t("محافظ خاموش")] == ("prot", "off") and KEYWORDS[t("راهنما")][0] == "help"
+    assert KEYWORDS[t("كوله‌پشتی")][0] == "inv"          # حروف عربی هم شناخته می‌شوند
+
+
+def test_button_colors():
+    from app.bot.ui import style_for
+    assert style_for("✅ تأیید") == "success" and style_for("❌ انصراف") == "danger"
+    assert style_for("🎒 کوله‌پشتی") == "primary" and style_for("❌ لغو درخواست") == "danger"
+    assert style_for("پذیرفتن قبیله") == "success" and style_for("⛔️ خاموش کردن") == "danger"
+
+
+def test_party_describe_texts():
+    from app.services import party
+    m = {"kind": "hostage", "names": {"1": "علی", "2": "محمد", "3": "هدف"}, "tg": {"1": 11, "2": 22, "3": 33},
+         "invites": {"2": "no", "3": "pending"}}
+    c = {"state": "party", "mods": m, "attacker_user_id": 1, "defender_user_id": 3, "party": [1]}
+    text, btns = party.describe(c)
+    assert "منتظر تأیید" in text and "درخواست شما را رد کرد" in text
+    assert {a for _, a in btns} == {"pj", "pn", "cancel"}
+    c["state"], m["defend_min"] = "defend_prompt", 5
+    c["party"] = [1, 2]
+    text, btns = party.describe(c)
+    assert "دفاع می‌کنید" in text and {a for _, a in btns} == {"defend", "surrender"}
+
+
+def test_help_covers_all_sections():
+    from app.bot.help_fa import COMMANDS, SECTIONS
+    assert {"hostage", "raid", "mug", "protect", "inv", "forest"} <= set(SECTIONS)
+    assert "گروگانگیری" in COMMANDS and "خفتگیری" in COMMANDS

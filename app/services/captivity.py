@@ -25,10 +25,12 @@ async def held_by(conn, user_id: int):
         "WHERE c.captor_id=$1 AND c.status='active' ORDER BY c.id", user_id)
 
 
-async def capture(conn, settings, captive_id: int, captor_id: int) -> int:
+async def capture(conn, settings, captive_id: int, captor_id: int, party: list = None) -> int:
     ends = now() + timedelta(hours=int(settings.get("captivity.max_hours")))
+    party = [int(x) for x in (party or []) if int(x) != captor_id]
     cid = await conn.fetchval(
-        "INSERT INTO captivities(captive_id, captor_id, ends_at) VALUES($1,$2,$3) RETURNING id", captive_id, captor_id, ends)
+        "INSERT INTO captivities(captive_id, captor_id, ends_at, party) VALUES($1,$2,$3,$4::jsonb) RETURNING id",
+        captive_id, captor_id, ends, json.dumps(party))
     await conn.execute("UPDATE characters SET location='captive', health=GREATEST(health, 10), rest_until=NULL WHERE user_id=$1",
                        captive_id)
     await conn.execute("UPDATE activities SET status='done', result='{\"cancelled\": true}'::jsonb WHERE user_id=$1 AND status='running'",
@@ -114,6 +116,63 @@ async def set_task(conn, settings, captor_id: int, cap_id: int, idx: int):
     return task
 
 
+async def _pay_captors(conn, cap, amount: int, reason: str):
+    """باج بین سرگروه و هم‌دستان به‌طور مساوی تقسیم می‌شود (باقیمانده برای سرگروه)."""
+    members = [cap["captor_id"]] + [int(x) for x in jload(cap["party"])]
+    share = amount // len(members)
+    for uid in members[1:]:
+        if share:
+            await change_coins(conn, uid, share, reason, ref=str(cap["id"]))
+    await change_coins(conn, members[0], amount - share * (len(members) - 1), reason, ref=str(cap["id"]))
+
+
+async def split_items(conn, settings, victim_id: int, members: list):
+    """هرچه قربانی همراه داشته (به‌جز لباس پایه) بین اسارت‌گیرها به‌نوبت و بر اساس ارزش تقسیم می‌شود.
+    آنچه در ظرفیت کسی جا نشود به خود قربانی برمی‌گردد."""
+    exp = now() + timedelta(hours=int(settings.get("drop.expire_hours")))
+    drop_id = await conn.fetchval("INSERT INTO drops(kind, victim_user_id, expires_at) VALUES('combat',$1,$2) RETURNING id",
+                                  victim_id, exp)
+    await inv.drop_carried(conn, victim_id, drop_id, "hostage_split")
+    entries = []
+    for st in await conn.fetch("SELECT s.def_id, s.qty, d.weight, d.value FROM item_stacks s JOIN item_defs d ON d.id=s.def_id "
+                               "WHERE s.holder_type='ground' AND s.holder_id=$1", drop_id):
+        entries.append(("s", st))
+    for it in await conn.fetch("SELECT i.id, i.def_id, d.weight, d.value FROM item_instances i JOIN item_defs d ON d.id=i.def_id "
+                               "WHERE i.holder_type='ground' AND i.holder_id=$1", drop_id):
+        entries.append(("i", it))
+    entries.sort(key=lambda e: -e[1]["value"])
+    free = {u: await inv.free_weight(conn, settings, u, await get_char(conn, u)) for u in members}
+    turn = 0
+    for kind, row in entries:
+        w = float(row["weight"])
+        if kind == "s":
+            left_qty = row["qty"]
+            for i in range(len(members)):         # تعداد را نوبتی بین اعضا پخش می‌کنیم
+                if left_qty <= 0:
+                    break
+                u = members[(turn + i) % len(members)]
+                share = max(1, row["qty"] // len(members)) if i < len(members) - 1 else left_qty
+                n = inv.fit_qty(w, free[u], min(share, left_qty))
+                if n > 0:
+                    await inv.move_stack(conn, "ground", drop_id, "backpack", u, row["def_id"], n, "hostage_split")
+                    free[u] -= n * w
+                    left_qty -= n
+        else:
+            for i in range(len(members)):
+                u = members[(turn + i) % len(members)]
+                if inv.fit_qty(w, free[u], 1) >= 1:
+                    await inv.move_instance(conn, row["id"], "ground", drop_id, "backpack", u, "hostage_split")
+                    await conn.execute("UPDATE item_instances SET owner_user_id=$2 WHERE id=$1", row["id"], u)
+                    free[u] -= w
+                    break
+        turn += 1
+    for st in await conn.fetch("SELECT def_id, qty FROM item_stacks WHERE holder_type='ground' AND holder_id=$1", drop_id):
+        await inv.move_stack(conn, "ground", drop_id, "backpack", victim_id, st["def_id"], st["qty"], "hostage_return")
+    for it in await conn.fetch("SELECT id FROM item_instances WHERE holder_type='ground' AND holder_id=$1", drop_id):
+        await inv.move_instance(conn, it["id"], "ground", drop_id, "backpack", victim_id, "hostage_return")
+    await conn.execute("DELETE FROM drops WHERE id=$1", drop_id)
+
+
 async def pay_ransom(conn, settings, captive_id: int, cap_id: int):
     cap = await get_cap(conn, cap_id)
     if cap["captive_id"] != captive_id or cap["ransom"] <= 0:
@@ -122,7 +181,7 @@ async def pay_ransom(conn, settings, captive_id: int, cap_id: int):
         await change_coins(conn, captive_id, -cap["ransom"], "ransom_paid", ref=str(cap_id))
     except InsufficientFunds as exc:
         raise GameError("سکه کافی نداری.") from exc
-    await change_coins(conn, cap["captor_id"], cap["ransom"], "ransom_received", ref=str(cap_id))
+    await _pay_captors(conn, cap, cap["ransom"], "ransom_received")
     await _end(conn, settings, cap, "ransom")
 
 
@@ -142,7 +201,7 @@ async def accept_offer(conn, settings, captor_id: int, cap_id: int):
         await change_coins(conn, cap["captive_id"], -cap["offer"], "ransom_paid", ref=str(cap_id))
     except InsufficientFunds as exc:
         raise GameError("اسیر دیگر این مقدار سکه ندارد.") from exc
-    await change_coins(conn, captor_id, cap["offer"], "ransom_received", ref=str(cap_id))
+    await _pay_captors(conn, cap, cap["offer"], "ransom_received")
     await _end(conn, settings, cap, "ransom")
 
 

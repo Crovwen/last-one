@@ -7,12 +7,13 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 
 from app import jobs_handlers
 from app.bot import combat_ui
-from app.bot.handlers import admin, groups, private
+from app.bot.handlers import admin, group_text, groups, private
 from app.config import load_config
 from app.context import AppContext
 from app.db import create_pool, run_migrations
@@ -55,7 +56,7 @@ async def create_app() -> web.Application:
 
     dp = Dispatcher(ctx=ctx)
     dp.include_router(admin.router)
-    dp.include_router(combat_ui.group_msgs)
+    dp.include_router(group_text.router)
     dp.include_router(combat_ui.router)
     dp.include_router(groups.router)
     dp.include_router(private.router)
@@ -68,6 +69,15 @@ async def create_app() -> web.Application:
     async def on_startup(_app: web.Application) -> None:
         await bot.set_webhook(cfg.webhook_url, secret_token=cfg.webhook_secret,
                               allowed_updates=dp.resolve_used_update_types())
+        try:
+            await bot.set_my_commands([BotCommand(command="menu", description="منوی اصلی"),
+                                       BotCommand(command="help", description="راهنما"),
+                                       BotCommand(command="forest", description="جنگل"),
+                                       BotCommand(command="inv", description="کوله‌پشتی"),
+                                       BotCommand(command="home", description="خانه"),
+                                       BotCommand(command="profile", description="شخصیت")])
+        except Exception:  # noqa: BLE001
+            log.warning("set_my_commands failed")
         await jobs.start()
         now = datetime.now(timezone.utc)
         await jobs.enqueue("backup", {}, now + timedelta(hours=int(settings.get("backup.interval_hours"))), "backup:recurring")

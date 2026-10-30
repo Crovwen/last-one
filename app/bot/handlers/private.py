@@ -5,13 +5,14 @@ import logging
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
-from app.bot import screens_core, screens_social, screens_world  # noqa: F401  (ثبت اکشن‌ها)
+from app.bot import screens_admin, screens_core, screens_help, screens_social, screens_world  # noqa: F401  (ثبت اکشن‌ها)
 from app.bot import texts_fa as t
 from app.bot.combat_ui import send_new
-from app.bot.ui import ACTIONS, INPUTS, Act, Screen, keyboard
+from app.bot.commands import KEYWORDS, SLASH, norm, open_action
+from app.bot.ui import ACTIONS, INPUTS, Act, Screen, keyboard, render
 from app.context import AppContext
 from app.runtime import with_user
 from app.services import accounts
@@ -23,14 +24,7 @@ router = Router(name="private")
 router.message.filter(F.chat.type == "private")
 
 
-def _render(screen: Screen, uid: int, msgs=None):
-    parts = []
-    if msgs:
-        parts.append("\n".join(msgs))
-    if screen.note:
-        parts.append(screen.note)
-    parts.append(screen.text)
-    return "\n\n".join(p for p in parts if p)[:4000], keyboard(uid, screen.rows, screen.back)
+_render = render
 
 
 async def _edit(cb: CallbackQuery, text: str, markup):
@@ -63,6 +57,15 @@ async def cmd_start(message: Message, ctx: AppContext):
     await message.answer(text, reply_markup=markup)
 
 
+@router.message(Command(*SLASH.keys()))
+async def on_slash(message: Message, command: CommandObject, ctx: AppContext):
+    try:
+        _, text, markup = await open_action(ctx, message.from_user.id, SLASH[command.command.lower()])
+    except GameError as exc:
+        return await message.answer("⚠️ " + str(exc))
+    await message.answer(text, reply_markup=markup)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, ctx: AppContext):
     uid = message.from_user.id
@@ -76,6 +79,9 @@ async def on_text(message: Message, ctx: AppContext):
             return None
         if st.startswith("in:") and st[3:] in INPUTS:
             return await INPUTS[st[3:]](ctx, conn, u, c, message.text, jload(u["state_data"]))
+        kw = KEYWORDS.get(norm(message.text))
+        if kw:
+            return await ACTIONS[kw[0]](ctx, conn, u, c, kw[1], "")
         return await screens_core.main_screen(ctx, conn, u, c)
 
     if (row["state"] or "") == accounts.STATE_AWAITING_NAME and await accounts.get_character(ctx.pool, row["id"]) is None:

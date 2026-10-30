@@ -36,16 +36,41 @@ def B(label: str, a: str, x="", y=""):
     return (label, a, str(x), str(y))
 
 
+_RED = ("❌", "لغو", "انصراف", "اخراج", "ترک", "رد ", "رد‌", "ردکردن", "🗑", "تسلیم", "نپذیر", "خاموش")
+_GREEN = ("✅", "تأیید", "تایید", "قبول", "پذیرش", "پذیرفتن", "شروع", "روشن", "ثبت‌نام", "ثبت نام")
+
+
+def style_for(label: str) -> str:
+    """رنگ دکمه: قرمز برای لغو/رد، سبز برای تأیید/پذیرش، آبی برای بقیه."""
+    if any(w in label for w in _RED) or label.strip().endswith(" رد") or label.strip() == "رد":
+        return "danger"
+    if any(w in label for w in _GREEN):
+        return "success"
+    return "primary"
+
+
+def btn(label: str, data: str, style: str = None) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=label, callback_data=data, style=style or style_for(label))
+
+
 def keyboard(uid: int, rows: list, back: str = "main") -> InlineKeyboardMarkup:
-    kb = [[InlineKeyboardButton(text=label, callback_data=Act(u=uid, a=a, x=x, y=y).pack()) for label, a, x, y in row]
-          for row in rows if row]
+    kb = [[btn(label, Act(u=uid, a=a, x=x, y=y).pack()) for label, a, x, y in row] for row in rows if row]
     if back:
-        nav = [InlineKeyboardButton(text="🔙 بازگشت" if back != "main" else "🏠 منوی اصلی",
-                                    callback_data=Act(u=uid, a=back).pack())]
+        nav = [btn("🔙 بازگشت" if back != "main" else "🏠 منوی اصلی", Act(u=uid, a=back).pack(), "primary")]
         if back != "main":
-            nav.append(InlineKeyboardButton(text="🏠 منو", callback_data=Act(u=uid, a="main").pack()))
+            nav.append(btn("🏠 منو", Act(u=uid, a="main").pack(), "primary"))
         kb.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def render(screen, uid: int, msgs=None):
+    parts = []
+    if msgs:
+        parts.append("\n".join(msgs))
+    if screen.note:
+        parts.append(screen.note)
+    parts.append(screen.text)
+    return "\n\n".join(p for p in parts if p)[:4000], keyboard(uid, screen.rows, screen.back)
 
 
 ACTIONS = {}

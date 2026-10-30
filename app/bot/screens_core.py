@@ -8,7 +8,7 @@ from app.bot.ui import (B, LOC_FA, Screen, action, ask, esc, fa_num, left, parse
 from app.services import animals as an
 from app.services import captivity, death, events, homes, hirelings, market, world
 from app.services import inventory as inv
-from app.services.chars import jload, player_stats, skills_of
+from app.services.chars import is_protected, jload, player_stats, skills_of
 from app.services.errors import GameError
 from app.services.settings import SKILLS
 
@@ -18,8 +18,8 @@ async def main_screen(ctx, conn, user, ch, note: str = "") -> Screen:
     cap = await captivity.active_for(conn, user["id"])
     held = await captivity.held_by(conn, user["id"])
     head = f"🌲 <b>LAST ONE</b> — {esc(ch['name'])}\n{LOC_FA.get(ch['location'], ch['location'])}   🪙 {fa_num(user['coins'])}\n"
-    if user["protected_until"] and user["protected_until"] > __import__("datetime").datetime.now(__import__("datetime").timezone.utc):
-        head += f"🛡 محافظت تازه‌وارد تا {left(user['protected_until'])} دیگر\n"
+    if is_protected(user):
+        head += f"🛡 محافظ تازه‌وارد فعال است ({left(user['protected_until'])} دیگر)\n"
     if ch["location"] == "dead":
         cost = ctx.settings.get("death.fast_respawn_cost")
         return Screen(head + "\n☠️ کشته شدی. به‌زودی در خانه برمی‌گردی.\n" + (f"بازگشت عادی: {left(ch['dead_until'])}" if ch["dead_until"] else ""),
@@ -32,7 +32,7 @@ async def main_screen(ctx, conn, user, ch, note: str = "") -> Screen:
         head += f"🎯 مأموریت: {esc(m['name'])} ({fa_num(m['progress'])}/{fa_num(m['amount'])})\n"
     rows = [[B("👤 شخصیت", "pf"), B("🎒 کوله‌پشتی", "inv")], [B("🌲 جنگل", "fo"), B("🏠 خانه", "ho")],
             [B("🐺 حیوانات", "an"), B("🛡 نیروها", "hr")], [B("🏕 قبیله", "tb"), B("🛒 مارکت", "mk")],
-            [B("📜 گزارش‌ها", "rp"), B("⚙️ تنظیمات", "st")]]
+            [B("📜 گزارش‌ها", "rp"), B("⚙️ تنظیمات", "st")], [B("📖 راهنما", "help")]]
     if held:
         rows.append([B(f"⛓ اسرای من ({fa_num(len(held))})", "cap_l")])
     return Screen(head, rows, back=None, note=note)
@@ -89,7 +89,9 @@ async def a_settings(ctx, conn, user, ch, x, y):
             "• عادی: حالت متعادل\n"
             f"• سریع: زمان کوتاه‌تر (×{fa_num(s.get('stance.fast_time_mult'))}) ولی ریسک بیشتر\n\n"
             f"رفتار فعلی: <b>{world.STANCE_FA[ch['stance']]}</b>")
-    return Screen(text, [[B(("✅ " if k == ch["stance"] else "") + v, "st", k) for k, v in world.STANCE_FA.items()]])
+    rows = [[B(("✅ " if k == ch["stance"] else "") + v, "st", k) for k, v in world.STANCE_FA.items()],
+            [B("🛡 محافظ تازه‌وارد", "prot"), B("📖 راهنما", "help")]]
+    return Screen(text, rows)
 
 
 # ───────── کوله‌پشتی و انبار ─────────
